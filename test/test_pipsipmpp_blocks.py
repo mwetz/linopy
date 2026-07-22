@@ -23,7 +23,9 @@ def simple_model(n_time: int = 12) -> linopy.Model:
     cap = m.add_variables(lower=0, name="cap")
     gen = m.add_variables(lower=0, coords=[time], name="gen")
     m.add_constraints(gen <= cap, name="caplimit")
-    m.add_constraints(gen >= xr.DataArray(np.linspace(1, 2, n_time), coords=[time]))
+    m.add_constraints(
+        gen >= xr.DataArray(np.linspace(1, 2, n_time), coords=[time]), name="demand"
+    )
     m.objective = 10 * cap + gen.sum()
     return m
 
@@ -99,3 +101,24 @@ def test_explicit_model_blocks_are_used() -> None:
     m.blocks = xr.DataArray(np.repeat([1, 2], 6), dims=["snapshot"])
     m.solve("pipsipmpp", LINEAR_LEAF_SOLVER="mumps", LINEAR_ROOT_SOLVER="mumps")
     assert m.status == "ok"
+
+
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+def test_duals_and_runtime_are_returned() -> None:
+    ref = simple_model(12)
+    ref.solve("highs")
+
+    m = simple_model(12)
+    m.solve(
+        "pipsipmpp", n_blocks=3, LINEAR_LEAF_SOLVER="mumps", LINEAR_ROOT_SOLVER="mumps"
+    )
+
+    for name in ("caplimit", "demand"):
+        dual = m.constraints[name].dual.values
+        assert np.isfinite(dual).all(), f"{name} duals must not be NaN"
+        np.testing.assert_allclose(dual, ref.constraints[name].dual.values, atol=1e-5)
+
+    # runtime is measured inside PIPS-IPM++ and reported through the solver report
+    assert m.solver is not None
+    assert m.solver.report is not None
+    assert m.solver.report.runtime > 0.0

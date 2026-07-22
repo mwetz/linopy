@@ -16,7 +16,6 @@ import shutil
 import subprocess as sub
 import sys
 import threading
-import time
 import warnings
 from abc import ABC
 from collections import namedtuple
@@ -4159,6 +4158,9 @@ class PIPSIPMpp(Solver[None]):
         {"n_blocks", "block_dim", "comm"}
     )
 
+    # set at build time: which rows are equalities (duals are gathered per kind)
+    _is_eq: np.ndarray | None = None
+
     @classmethod
     @functools.cache
     def is_available(cls) -> bool:
@@ -4272,6 +4274,7 @@ class PIPSIPMpp(Solver[None]):
         self.solver_model = problem
         self.io_api = "direct"
         self.sense = model.sense
+        self._is_eq = is_eq
         self._cache_model_labels(model)
 
     def _run_direct(
@@ -4305,12 +4308,11 @@ class PIPSIPMpp(Solver[None]):
         if log_fn is not None:
             logger.warning("Log files are not supported by PIPS-IPM++. Ignoring.")
 
-        start = time.time()
         # rank 0 owns the problem; pipsipmpppy scatters the blocks collectively
         result = pipsipmpppy.solve(
             problem if comm.Get_rank() == 0 else None, comm, options=pips_options
         )
-        runtime = time.time() - start
+        runtime = float(result.runtime)  # measured inside PIPS-IPM++
 
         # PIPS-IPM++ reports 0 for a successful termination
         condition = (
@@ -4321,8 +4323,11 @@ class PIPSIPMpp(Solver[None]):
         status = Status.from_termination_condition(condition)
         status.legacy_status = str(result.status)
 
-        # only rank 0 gathers the primal -> share it so every rank is consistent
-        primal = comm.bcast(result.primal if comm.Get_rank() == 0 else None, root=0)
+        # only rank 0 gathers primal/duals -> share them so every rank is consistent
+        is_root = comm.Get_rank() == 0
+        primal = comm.bcast(result.primal if is_root else None, root=0)
+        dual_eq = comm.bcast(result.dual_eq if is_root else None, root=0)
+        dual_ineq = comm.bcast(result.dual_ineq if is_root else None, root=0)
         objective = float(result.objective)
         if self.sense == "max":
             objective = -objective
@@ -4331,8 +4336,15 @@ class PIPSIPMpp(Solver[None]):
             sol = _solution_from_labels(
                 np.asarray(primal, dtype=float), self._vlabels, self._n_vars
             )
-            # PIPS-IPM++ does not return duals through the C API yet
-            dual = np.full(self._n_cons, np.nan)
+            # weave the separately gathered eq/ineq duals back into row order
+            is_eq = self._is_eq
+            assert is_eq is not None
+            rows = np.empty(is_eq.size, dtype=float)
+            rows[is_eq] = np.asarray(dual_eq, dtype=float)
+            rows[~is_eq] = np.asarray(dual_ineq, dtype=float)
+            if self.sense == "max":
+                rows = -rows
+            dual = _solution_from_labels(rows, self._clabels, self._n_cons)
             return Solution(sol, dual, objective)
 
         solution = self.safe_get_solution(status=status, func=get_solver_solution)
