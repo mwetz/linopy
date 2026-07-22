@@ -4161,6 +4161,26 @@ class PIPSIPMpp(Solver[None]):
     # set at build time: which rows are equalities (duals are gathered per kind)
     _is_eq: np.ndarray | None = None
 
+    @functools.cached_property
+    def _CONDITION_MAP(self) -> dict[Any, TerminationCondition]:
+        """PIPS-IPM++ termination status -> linopy termination condition."""
+        from pipsipmpppy import TerminationStatus as T
+
+        TC = TerminationCondition
+        return {
+            T.SUCCESSFUL_TERMINATION: TC.optimal,
+            T.NOT_FINISHED: TC.other,
+            T.MAX_ITS_EXCEEDED: TC.iteration_limit,
+            T.TIMELIMIT: TC.time_limit,
+            T.INFEASIBLE: TC.infeasible,
+            T.UNBOUNDED: TC.unbounded,
+            T.READ_ERROR: TC.error,
+            T.DID_NOT_RUN: TC.error,
+            T.STOPPED_AFTER_PRESOLVE: TC.user_interrupt,
+            T.SLOW_CONVERGENCE: TC.suboptimal,
+            T.NUMERICAL: TC.internal_solver_error,
+        }
+
     @classmethod
     @functools.cache
     def is_available(cls) -> bool:
@@ -4314,14 +4334,9 @@ class PIPSIPMpp(Solver[None]):
         )
         runtime = float(result.runtime)  # measured inside PIPS-IPM++
 
-        # PIPS-IPM++ reports 0 for a successful termination
-        condition = (
-            TerminationCondition.optimal
-            if result.status == 0
-            else TerminationCondition.unknown
-        )
+        condition = self._CONDITION_MAP.get(result.status, TerminationCondition.unknown)
         status = Status.from_termination_condition(condition)
-        status.legacy_status = str(result.status)
+        status.legacy_status = f"{result.status.name}: {result.status.description}"
 
         # only rank 0 gathers primal/duals -> share them so every rank is consistent
         is_root = comm.Get_rank() == 0
@@ -4333,6 +4348,8 @@ class PIPSIPMpp(Solver[None]):
             objective = -objective
 
         def get_solver_solution() -> Solution:
+            if primal is None:  # status without a gathered iterate
+                return Solution(objective=objective)
             sol = _solution_from_labels(
                 np.asarray(primal, dtype=float), self._vlabels, self._n_vars
             )

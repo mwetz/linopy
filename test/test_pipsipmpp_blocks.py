@@ -16,12 +16,14 @@ from linopy.solvers import PIPSIPMpp
 pipsipmpp_available = PIPSIPMpp.is_available()
 
 
-def simple_model(n_time: int = 12) -> linopy.Model:
+def simple_model(n_time: int = 12, infeasible: bool = False) -> linopy.Model:
     """Cap (no time dim -> root) + gen (time dim -> leaves), coupled by gen <= cap."""
     time = pd.Index(range(n_time), name="snapshot")
     m = linopy.Model()
     cap = m.add_variables(lower=0, name="cap")
-    gen = m.add_variables(lower=0, coords=[time], name="gen")
+    gen = m.add_variables(
+        lower=0, upper=0 if infeasible else np.inf, coords=[time], name="gen"
+    )
     m.add_constraints(gen <= cap, name="caplimit")
     m.add_constraints(
         gen >= xr.DataArray(np.linspace(1, 2, n_time), coords=[time]), name="demand"
@@ -122,3 +124,40 @@ def test_duals_and_runtime_are_returned() -> None:
     assert m.solver is not None
     assert m.solver.report is not None
     assert m.solver.report.runtime > 0.0
+
+
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+def test_termination_status_map_covers_every_pips_status() -> None:
+    """Every PIPS-IPM++ status must map to a linopy termination condition."""
+    from pipsipmpppy import TerminationStatus
+
+    mapping = PIPSIPMpp(model=None)._CONDITION_MAP
+    missing = set(TerminationStatus) - set(mapping)
+    assert not missing, (
+        f"unmapped PIPS-IPM++ statuses: {sorted(s.name for s in missing)}"
+    )
+
+
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.parametrize(
+    "kwargs,options,expected",
+    [
+        ({}, {}, "optimal"),
+        ({"infeasible": True}, {}, "infeasible"),
+        ({}, {"STOP_AFTER_PRESOLVE": True}, "user_interrupt"),
+    ],
+)
+def test_statuses_are_propagated(kwargs, options, expected) -> None:
+    m = simple_model(12, **kwargs)
+    _, condition = m.solve(
+        "pipsipmpp",
+        n_blocks=3,
+        LINEAR_LEAF_SOLVER="mumps",
+        LINEAR_ROOT_SOLVER="mumps",
+        **options,
+    )
+    assert condition == expected
+    # statuses without an iterate must not fabricate a solution
+    if expected != "optimal":
+        assert m.solver is not None
+        assert m.solver.status.legacy_status.split(":")[0] != "SUCCESSFUL_TERMINATION"
