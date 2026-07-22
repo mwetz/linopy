@@ -16,6 +16,7 @@ import shutil
 import subprocess as sub
 import sys
 import threading
+import time
 import warnings
 from abc import ABC
 from collections import namedtuple
@@ -338,7 +339,7 @@ io_structure = dict(
         "mosek",
         "mindopt",
     },
-    blocks={"pips"},
+    blocks={"pipsipmpp"},
 )
 
 
@@ -355,7 +356,7 @@ class SolverName(enum.Enum):
     Mosek = "mosek"
     COPT = "copt"
     MindOpt = "mindopt"
-    PIPS = "pips"
+    PIPSIPMpp = "pipsipmpp"
     cuPDLPx = "cupdlpx"
 
 
@@ -4110,14 +4111,239 @@ class MindOpt(Solver[None]):
             env_.dispose()
 
 
-class PIPS(Solver[None]):
+class PIPSIPMpp(Solver[None]):
     """
-    Solver subclass for the PIPS solver.
+    Solver subclass for PIPS-IPM++, via the ``pipsipmpppy`` package.
+
+    PIPS-IPM++ is a parallel interior-point solver that exploits a
+    doubly-bordered block-diagonal LP: variables belong either to a root
+    (coupling) block or to one of N leaf blocks, and the leaves are distributed
+    over MPI ranks. Constraint blocks are derived from the variable assignment.
+
+    The assignment uses linopy's block concept, :attr:`Model.blocks`: a
+    one-dimensional DataArray over the dimension that is split -- for a power
+    system model the time dimension (``snapshot``). Variables carrying that
+    dimension (dispatch) go to the leaf of their time block; variables without
+    it (capacity / investment) couple the leaves and go to the root. Block ``0``
+    is the root, ``1..N`` the leaves, matching linopy's own convention.
+
+    If :attr:`Model.blocks` is unset, pass ``n_blocks`` (and optionally
+    ``block_dim``, default ``"snapshot"``) as a solver option to split that
+    dimension into contiguous blocks::
+
+        m.solve("pipsipmpp", n_blocks=4, LINEAR_LEAF_SOLVER="mumps")
+
+    Run under MPI to parallelise -- PIPS-IPM++ needs at least one leaf per rank::
+
+        mpirun -n 4 python model.py
+
+    Options other than ``n_blocks`` / ``block_dim`` / ``comm`` are forwarded to
+    PIPS-IPM++ (e.g. ``LINEAR_LEAF_SOLVER``, ``LINEAR_ROOT_SOLVER``).
+
+    Attributes
+    ----------
+    **solver_options
+        options for the given solver
     """
 
+    display_name: ClassVar[str] = "PIPS-IPM++"
+    features: ClassVar[frozenset[SolverFeature]] = frozenset(
+        {
+            SolverFeature.DIRECT_API,
+            SolverFeature.SOLUTION_FILE_NOT_NEEDED,
+        }
+    )
+
+    # consumed by this interface, not forwarded to PIPS-IPM++
+    _INTERFACE_OPTIONS: ClassVar[frozenset[str]] = frozenset(
+        {"n_blocks", "block_dim", "comm"}
+    )
+
+    @classmethod
+    @functools.cache
+    def is_available(cls) -> bool:
+        return _has_module("pipsipmpppy")
+
     def __post_init__(self) -> None:
-        msg = "The PIPS solver interface is not yet implemented."
-        raise NotImplementedError(msg)
+        super().__post_init__()
+        # LP/MPS files carry no block structure, so PIPS-IPM++ is direct-API only.
+        if self.io_api not in (None, "direct"):
+            warnings.warn(
+                f"PIPS-IPM++ only supports io_api='direct', ignoring {self.io_api!r}.",
+                UserWarning,
+                stacklevel=2,
+            )
+        self.io_api = "direct"
+
+    @staticmethod
+    def _blocks_from_dim(model: Model, block_dim: str, n_blocks: int) -> Any:
+        """Contiguous split of ``block_dim`` into leaf blocks ``1..n_blocks``."""
+        import xarray as xr
+
+        dims = model.variables.labels.dims
+        if block_dim not in dims:
+            raise ValueError(
+                f"Block dimension {block_dim!r} not found in the model variables. "
+                f"Available dimensions: {sorted(map(str, dims))}. Set `block_dim` or assign "
+                "`model.blocks` explicitly."
+            )
+        size = int(model.variables.labels.sizes[block_dim])
+        if not 1 <= n_blocks <= size:
+            raise ValueError(
+                f"n_blocks must be between 1 and the size of {block_dim!r} ({size}), "
+                f"got {n_blocks}."
+            )
+        edges = np.linspace(0, size, n_blocks + 1).astype(int)
+        values = np.empty(size, dtype=np.int64)
+        for i in range(n_blocks):
+            values[edges[i] : edges[i + 1]] = i + 1  # 0 is reserved for the root
+        return xr.DataArray(values, dims=[block_dim])
+
+    @staticmethod
+    def _variable_blocks(model: Model, blocks: Any) -> tuple[np.ndarray, int]:
+        """Label-indexed block id per variable; 0 (root) for block-free variables."""
+        dim = blocks.dims[0]
+        label_block = np.zeros(model._xCounter + 1, dtype=np.int64)
+        for _name, variable in model.variables.items():
+            if dim not in variable.dims:
+                continue  # no block dimension -> coupling variable, stays root
+            labels = variable.labels.values.ravel()
+            values = blocks.broadcast_like(variable.labels).values.ravel()
+            mask = labels != -1
+            label_block[labels[mask]] = values[mask]
+        return label_block, int(blocks.max())
+
+    def _build_direct(self, **kwargs: Any) -> None:
+        import pipsipmpppy
+
+        model = self.model
+        assert model is not None
+        if model.type in ["QP", "MILP"]:
+            raise NotImplementedError("PIPS-IPM++ solves linear problems only.")
+        if kwargs.get("explicit_coordinate_names"):
+            warnings.warn(
+                "PIPS-IPM++ does not support named variables/constraints. "
+                "The explicit_coordinate_names parameter is ignored.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        blocks = model.blocks
+        if blocks is None:
+            n_blocks = self.options.get("n_blocks")
+            if n_blocks is None:
+                raise ValueError(
+                    "PIPS-IPM++ needs a block structure. Set `model.blocks` (a 1-D "
+                    "DataArray over the dimension to split) or pass the solver "
+                    "option `n_blocks=<int>` to split `block_dim` "
+                    "(default 'snapshot') into contiguous blocks."
+                )
+            blocks = self._blocks_from_dim(
+                model, self.options.get("block_dim", "snapshot"), int(n_blocks)
+            )
+        label_block, n_leaves = self._variable_blocks(model, blocks)
+
+        M = model.matrices
+        if M.A is None:
+            raise ValueError("Model has no constraints, cannot export to PIPS-IPM++.")
+        A = M.A.tocsr()
+        sense = np.asarray(M.sense, dtype=object)
+        is_eq = sense == "="
+        is_ge = sense == ">"
+
+        # PIPS-IPM++ minimises; a max objective is negated and flipped back afterwards.
+        sign = -1.0 if model.sense == "max" else 1.0
+        objconst = float(getattr(model.objective, "constant", 0.0) or 0.0)
+
+        problem = pipsipmpppy.StructuredProblem(
+            n_blocks=n_leaves,
+            var_block=label_block[M.vlabels],
+            c=sign * np.asarray(M.c, dtype=float),
+            xlow=np.asarray(M.lb, dtype=float),
+            xupp=np.asarray(M.ub, dtype=float),
+            A_eq=A[is_eq],
+            b_eq=np.asarray(M.b, dtype=float)[is_eq],
+            A_ineq=A[~is_eq],
+            ineq_low=np.where(is_ge, M.b, -np.inf)[~is_eq].astype(float),
+            ineq_upp=np.where(is_ge, np.inf, M.b)[~is_eq].astype(float),
+            objconst=sign * objconst,
+        )
+
+        self.solver_model = problem
+        self.io_api = "direct"
+        self.sense = model.sense
+        self._cache_model_labels(model)
+
+    def _run_direct(
+        self,
+        solution_fn: Path | None = None,
+        log_fn: Path | None = None,
+        warmstart_fn: Path | None = None,
+        basis_fn: Path | None = None,
+        env: Any = None,
+        **kw: Any,
+    ) -> Result:
+        import pipsipmpppy
+
+        problem = self.solver_model
+        assert problem is not None
+
+        comm = self.options.get("comm")
+        if comm is None:
+            from mpi4py import MPI
+
+            comm = MPI.COMM_WORLD
+        pips_options = {
+            k: v for k, v in self.options.items() if k not in self._INTERFACE_OPTIONS
+        }
+
+        for fn, what in ((warmstart_fn, "Warmstart"), (basis_fn, "Basis")):
+            if fn is not None:
+                logger.warning(
+                    "%s files are not supported by PIPS-IPM++. Ignoring.", what
+                )
+        if log_fn is not None:
+            logger.warning("Log files are not supported by PIPS-IPM++. Ignoring.")
+
+        start = time.time()
+        # rank 0 owns the problem; pipsipmpppy scatters the blocks collectively
+        result = pipsipmpppy.solve(
+            problem if comm.Get_rank() == 0 else None, comm, options=pips_options
+        )
+        runtime = time.time() - start
+
+        # PIPS-IPM++ reports 0 for a successful termination
+        condition = (
+            TerminationCondition.optimal
+            if result.status == 0
+            else TerminationCondition.unknown
+        )
+        status = Status.from_termination_condition(condition)
+        status.legacy_status = str(result.status)
+
+        # only rank 0 gathers the primal -> share it so every rank is consistent
+        primal = comm.bcast(result.primal if comm.Get_rank() == 0 else None, root=0)
+        objective = float(result.objective)
+        if self.sense == "max":
+            objective = -objective
+
+        def get_solver_solution() -> Solution:
+            sol = _solution_from_labels(
+                np.asarray(primal, dtype=float), self._vlabels, self._n_vars
+            )
+            # PIPS-IPM++ does not return duals through the C API yet
+            dual = np.full(self._n_cons, np.nan)
+            return Solution(sol, dual, objective)
+
+        solution = self.safe_get_solution(status=status, func=get_solver_solution)
+
+        self.io_api = "direct"
+        return self._make_result(
+            status,
+            solution,
+            solver_model=problem,
+            report=SolverReport(runtime=runtime),
+        )
 
 
 class cuPDLPx(Solver[None]):
@@ -4420,7 +4646,7 @@ _SOLVER_PROBE_ORDER: tuple[str, ...] = (
     "mindopt",
     "copt",
     "cupdlpx",
-    "pips",
+    "pipsipmpp",
 )
 
 

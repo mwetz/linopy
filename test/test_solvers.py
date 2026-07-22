@@ -460,7 +460,7 @@ def test_gurobi_environment_with_gurobi_env(model: Model, tmp_path: Path) -> Non
         (solvers.cuPDLPx, SolverFeature.QUADRATIC_OBJECTIVE, False),
         (solvers.Gurobi, SolverFeature.GPU_ONLY, False),
         (solvers.Xpress, SolverFeature.GPU_ONLY, False),
-        (solvers.PIPS, SolverFeature.INTEGER_VARIABLES, False),
+        (solvers.PIPSIPMpp, SolverFeature.INTEGER_VARIABLES, False),
     ],
 )
 def test_solver_class_supports_feature(
