@@ -4136,8 +4136,18 @@ class PIPSIPMpp(Solver[None]):
 
         mpirun -n 4 python model.py
 
-    Options other than ``n_blocks`` / ``block_dim`` / ``comm`` are forwarded to
-    PIPS-IPM++ (e.g. ``LINEAR_LEAF_SOLVER``, ``LINEAR_ROOT_SOLVER``).
+    Passing ``write_parquet=<path>`` also writes the annotated problem out, in
+    the layout named by ``parquet_layout`` (``"monolithic"``, the default, or
+    ``"distributed"``)::
+
+        m.solve("pipsipmpp", n_blocks=4, write_parquet="model",
+                parquet_layout="distributed")
+
+    To write the files without solving, use :meth:`write_parquet`.
+
+    Options other than ``n_blocks`` / ``block_dim`` / ``comm`` /
+    ``write_parquet`` / ``parquet_layout`` are forwarded to PIPS-IPM++ (e.g.
+    ``LINEAR_LEAF_SOLVER``, ``LINEAR_ROOT_SOLVER``).
 
     Attributes
     ----------
@@ -4155,7 +4165,7 @@ class PIPSIPMpp(Solver[None]):
 
     # consumed by this interface, not forwarded to PIPS-IPM++
     _INTERFACE_OPTIONS: ClassVar[frozenset[str]] = frozenset(
-        {"n_blocks", "block_dim", "comm"}
+        {"n_blocks", "block_dim", "comm", "write_parquet", "parquet_layout"}
     )
 
     # set at build time: which rows are equalities (duals are gathered per kind)
@@ -4235,24 +4245,21 @@ class PIPSIPMpp(Solver[None]):
             label_block[labels[mask]] = values[mask]
         return label_block, int(blocks.max())
 
-    def _build_direct(self, **kwargs: Any) -> None:
+    @classmethod
+    def _structured_problem(
+        cls,
+        model: Model,
+        n_blocks: int | None = None,
+        block_dim: str = "snapshot",
+    ) -> tuple[Any, np.ndarray]:
+        """Build the ``StructuredProblem`` for ``model``, and which rows are equalities."""
         import pipsipmpppy
 
-        model = self.model
-        assert model is not None
         if model.type in ["QP", "MILP"]:
             raise NotImplementedError("PIPS-IPM++ solves linear problems only.")
-        if kwargs.get("explicit_coordinate_names"):
-            warnings.warn(
-                "PIPS-IPM++ does not support named variables/constraints. "
-                "The explicit_coordinate_names parameter is ignored.",
-                UserWarning,
-                stacklevel=2,
-            )
 
         blocks = model.blocks
         if blocks is None:
-            n_blocks = self.options.get("n_blocks")
             if n_blocks is None:
                 raise ValueError(
                     "PIPS-IPM++ needs a block structure. Set `model.blocks` (a 1-D "
@@ -4260,10 +4267,8 @@ class PIPSIPMpp(Solver[None]):
                     "option `n_blocks=<int>` to split `block_dim` "
                     "(default 'snapshot') into contiguous blocks."
                 )
-            blocks = self._blocks_from_dim(
-                model, self.options.get("block_dim", "snapshot"), int(n_blocks)
-            )
-        label_block, n_leaves = self._variable_blocks(model, blocks)
+            blocks = cls._blocks_from_dim(model, block_dim, int(n_blocks))
+        label_block, n_leaves = cls._variable_blocks(model, blocks)
 
         M = model.matrices
         if M.A is None:
@@ -4290,6 +4295,70 @@ class PIPSIPMpp(Solver[None]):
             ineq_upp=np.where(is_ge, np.inf, M.b)[~is_eq].astype(float),
             objconst=sign * objconst,
         )
+        return problem, is_eq
+
+    @classmethod
+    def write_parquet(
+        cls,
+        model: Model,
+        path: str | Path,
+        layout: str = "monolithic",
+        n_blocks: int | None = None,
+        block_dim: str = "snapshot",
+    ) -> Path:
+        """Write ``model`` as annotated parquet without solving it.
+
+        The block structure is taken from :attr:`Model.blocks`, or from
+        ``n_blocks``/``block_dim`` the same way :meth:`solve` takes it. ``layout``
+        is ``"monolithic"`` for one set of files holding the whole model, or
+        ``"distributed"`` for one set per block, which lets each rank of a later
+        solve read only its own share::
+
+            PIPSIPMpp.write_parquet(m, "model", layout="distributed", n_blocks=8)
+
+        The files can be handed to PIPS-IPM++ directly (``pipsparquet model``),
+        inspected with pipstools, or read back with ``pipsipmpppy``.
+        """
+        import pipsipmpppy
+
+        problem, _ = cls._structured_problem(model, n_blocks, block_dim)
+        return pipsipmpppy.write_problem(
+            problem,
+            path,
+            layout=layout,
+            # the problem carries minimisation costs; the sense records how the
+            # model stated them
+            sense=-1.0 if model.sense == "max" else 1.0,
+        )
+
+    def _build_direct(self, **kwargs: Any) -> None:
+        model = self.model
+        assert model is not None
+        if kwargs.get("explicit_coordinate_names"):
+            warnings.warn(
+                "PIPS-IPM++ does not support named variables/constraints. "
+                "The explicit_coordinate_names parameter is ignored.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        problem, is_eq = self._structured_problem(
+            model,
+            self.options.get("n_blocks"),
+            self.options.get("block_dim", "snapshot"),
+        )
+
+        write_to = self.options.get("write_parquet")
+        if write_to is not None:
+            import pipsipmpppy
+
+            stem = pipsipmpppy.write_problem(
+                problem,
+                write_to,
+                layout=self.options.get("parquet_layout", "monolithic"),
+                sense=-1.0 if model.sense == "max" else 1.0,
+            )
+            logger.info("Wrote the annotated problem to %s", stem)
 
         self.solver_model = problem
         self.io_api = "direct"

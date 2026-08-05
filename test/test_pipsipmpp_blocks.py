@@ -161,3 +161,55 @@ def test_statuses_are_propagated(kwargs, options, expected) -> None:
     if expected != "optimal":
         assert m.solver is not None
         assert m.solver.status.legacy_status.split(":")[0] != "SUCCESSFUL_TERMINATION"
+
+
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.parametrize("layout", ["monolithic", "distributed"])
+def test_write_parquet_exports_without_solving(tmp_path, layout) -> None:
+    """The annotated model can be written out for a later or remote solve."""
+    pytest.importorskip("pyarrow")
+    import pipsipmpppy
+
+    m = simple_model(12)
+    stem = PIPSIPMpp.write_parquet(m, tmp_path / "model", layout=layout, n_blocks=3)
+
+    manifest = pipsipmpppy.read_manifest(stem)
+    assert manifest["layout"] == layout
+    assert manifest["n_blocks"] == 4  # the root counts alongside the three leaves
+    assert manifest["n_cols"] == m.matrices.vlabels.size
+    # the leaves carry the dispatch variables, the root the single capacity
+    assert [block["n"] for block in manifest["blocks"]] == [1, 4, 4, 4]
+
+
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+def test_write_parquet_records_a_maximisation(tmp_path) -> None:
+    pytest.importorskip("pyarrow")
+    import pipsipmpppy
+
+    m = simple_model(12)
+    m.objective = -(10 * m.variables["cap"] + m.variables["gen"].sum())
+    m.objective.sense = "max"
+
+    stem = PIPSIPMpp.write_parquet(m, tmp_path / "model", n_blocks=3)
+    # the problem holds minimisation costs; objcoef records how the model stated them
+    assert pipsipmpppy.read_manifest(stem)["objcoef"] == -1.0
+
+
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+def test_both_layouts_describe_the_same_problem(tmp_path) -> None:
+    pytest.importorskip("pyarrow")
+    import pipsipmpppy
+
+    m = simple_model(12)
+    whole = pipsipmpppy.read_manifest(
+        PIPSIPMpp.write_parquet(m, tmp_path / "whole", n_blocks=3)
+    )
+    split = pipsipmpppy.read_manifest(
+        PIPSIPMpp.write_parquet(m, tmp_path / "split", layout="distributed", n_blocks=3)
+    )
+
+    assert (whole["n_rows"], whole["n_cols"]) == (split["n_rows"], split["n_cols"])
+    keys = ("n", "my", "mz", "myl", "mzl")
+    assert [[b[k] for k in keys] for b in whole["blocks"]] == [
+        [b[k] for k in keys] for b in split["blocks"]
+    ]
