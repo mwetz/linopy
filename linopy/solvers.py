@@ -4145,9 +4145,16 @@ class PIPSIPMpp(Solver[None]):
 
     To write the files without solving, use :meth:`write_parquet`.
 
+    ``options_file`` names a PIPS-IPM++ settings file - one ``NAME value`` per
+    line, ``#`` and ``//`` starting a comment - read as the *base* configuration,
+    so a run is repeatable from a file while single options stay adjustable::
+
+        m.solve("pipsipmpp", n_blocks=4, options_file="tuned.opt",
+                LINEAR_LEAF_SOLVER="mumps")   # overrides the file
+
     Options other than ``n_blocks`` / ``block_dim`` / ``comm`` /
-    ``write_parquet`` / ``parquet_layout`` are forwarded to PIPS-IPM++ (e.g.
-    ``LINEAR_LEAF_SOLVER``, ``LINEAR_ROOT_SOLVER``).
+    ``write_parquet`` / ``parquet_layout`` / ``options_file`` are forwarded to
+    PIPS-IPM++ (e.g. ``LINEAR_LEAF_SOLVER``, ``LINEAR_ROOT_SOLVER``).
 
     Attributes
     ----------
@@ -4165,7 +4172,14 @@ class PIPSIPMpp(Solver[None]):
 
     # consumed by this interface, not forwarded to PIPS-IPM++
     _INTERFACE_OPTIONS: ClassVar[frozenset[str]] = frozenset(
-        {"n_blocks", "block_dim", "comm", "write_parquet", "parquet_layout"}
+        {
+            "n_blocks",
+            "block_dim",
+            "comm",
+            "write_parquet",
+            "parquet_layout",
+            "options_file",
+        }
     )
 
     # set at build time: which rows are equalities (duals are gathered per kind)
@@ -4399,7 +4413,10 @@ class PIPSIPMpp(Solver[None]):
 
         # rank 0 owns the problem; pipsipmpppy scatters the blocks collectively
         result = pipsipmpppy.solve(
-            problem if comm.Get_rank() == 0 else None, comm, options=pips_options
+            problem if comm.Get_rank() == 0 else None,
+            comm,
+            options=pips_options,
+            options_file=self.options.get("options_file"),
         )
         runtime = float(result.runtime)  # measured inside PIPS-IPM++
 

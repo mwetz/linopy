@@ -213,3 +213,54 @@ def test_both_layouts_describe_the_same_problem(tmp_path) -> None:
     assert [[b[k] for k in keys] for b in whole["blocks"]] == [
         [b[k] for k in keys] for b in split["blocks"]
     ]
+
+
+@pytest.fixture
+def options_file(tmp_path):
+    """A settings file, as a repeatable run would keep on disk."""
+    path = tmp_path / "base.opt"
+    path.write_text(
+        "# base configuration\n"
+        "SCALER                       geometricmean\n"
+        "PRESOLVE_BOUND_STR_MAX_ITER  7\n"
+    )
+    return path
+
+
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+def test_options_file_is_used_as_the_base(options_file) -> None:
+    m = simple_model(9)
+    _, condition = m.solve("pipsipmpp", n_blocks=3, options_file=str(options_file))
+    assert condition == "optimal"
+
+
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+def test_solver_options_override_the_file(options_file) -> None:
+    """The file is the base; options passed alongside it win."""
+    m = simple_model(9)
+    _, condition = m.solve(
+        "pipsipmpp",
+        n_blocks=3,
+        options_file=str(options_file),
+        SCALER="none",
+        PRESOLVE_BOUND_STR_MAX_ITER=2,
+    )
+    assert condition == "optimal"
+
+    # both settings only steer how the solve is carried out, so the same optimum
+    # comes back, to the solver's convergence tolerance
+    plain = simple_model(9)
+    plain.solve("pipsipmpp", n_blocks=3)
+    assert m.objective.value == pytest.approx(plain.objective.value, abs=1e-5)
+
+
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+def test_a_missing_options_file_is_reported(tmp_path) -> None:
+    m = simple_model(9)
+    with pytest.raises(FileNotFoundError, match="options file"):
+        m.solve("pipsipmpp", n_blocks=3, options_file=str(tmp_path / "absent.opt"))
+
+
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+def test_options_file_is_not_forwarded_as_a_solver_option() -> None:
+    assert "options_file" in PIPSIPMpp._INTERFACE_OPTIONS
