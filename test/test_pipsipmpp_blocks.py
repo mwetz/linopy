@@ -264,3 +264,71 @@ def test_a_missing_options_file_is_reported(tmp_path) -> None:
 @pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
 def test_options_file_is_not_forwarded_as_a_solver_option() -> None:
     assert "options_file" in PIPSIPMpp._INTERFACE_OPTIONS
+
+
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.parametrize("layout", ["monolithic", "distributed"])
+def test_write_parquet_carries_model_names(tmp_path, layout) -> None:
+    """Names make a plotted matrix readable, so they must match the model's own."""
+    pytest.importorskip("pyarrow")
+    import pipsipmpppy
+
+    m = simple_model(6)
+    stem = PIPSIPMpp.write_parquet(
+        m, tmp_path / "named", layout=layout, n_blocks=3, names=True
+    )
+    names = pipsipmpppy.read_names(stem)
+
+    assert names["cols"] == ["cap"] + [f"gen[{i}]" for i in range(6)]
+    # rows are stored equalities first, and this model has only inequalities
+    assert sorted(names["rows"]) == sorted(
+        [f"caplimit[{i}]" for i in range(6)] + [f"demand[{i}]" for i in range(6)]
+    )
+
+
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+def test_names_line_up_with_the_rows_they_label(tmp_path) -> None:
+    """A name on the wrong row would mislabel a plot without failing anywhere."""
+    pq = pytest.importorskip("pyarrow.parquet")
+
+    m = simple_model(6)
+    stem = PIPSIPMpp.write_parquet(m, tmp_path / "named", n_blocks=3, names=True)
+    cols = pq.read_table(f"{stem}.cols.parquet").to_pandas()
+    rows = pq.read_table(f"{stem}.rows.parquet").to_pandas()
+    amat = pq.read_table(f"{stem}.amat.parquet").to_pandas()
+
+    # caplimit[i] is `gen[i] <= cap`, so it touches exactly cap and gen[i]
+    row = rows.index[rows["name"] == "caplimit[3]"][0]
+    touched = {cols["name"][c] for c in amat.loc[amat["row"] == row, "col"]}
+    assert touched == {"cap", "gen[3]"}
+
+    # cap has no block dimension, so it is the root/coupling variable
+    assert int(cols.loc[cols["name"] == "cap", "partition"].iloc[0]) == 1
+    assert int(cols.loc[cols["name"] == "gen[3]", "partition"].iloc[0]) != 1
+
+
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+def test_names_can_be_left_out(tmp_path) -> None:
+    pytest.importorskip("pyarrow")
+    import pipsipmpppy
+
+    m = simple_model(6)
+    plain = PIPSIPMpp.write_parquet(m, tmp_path / "plain", n_blocks=3, names=False)
+    assert pipsipmpppy.read_names(plain) == {}
+    # leaving the names out must not change the structure
+    named = PIPSIPMpp.write_parquet(m, tmp_path / "named", n_blocks=3, names=True)
+    keys = ("n", "my", "mz", "myl", "mzl")
+    assert [
+        [b[k] for k in keys] for b in pipsipmpppy.read_manifest(plain)["blocks"]
+    ] == [[b[k] for k in keys] for b in pipsipmpppy.read_manifest(named)["blocks"]]
+
+
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+def test_names_are_off_by_default(tmp_path) -> None:
+    """Producing names costs a lookup per label, so they are opt-in."""
+    pytest.importorskip("pyarrow")
+    import pipsipmpppy
+
+    m = simple_model(6)
+    default = PIPSIPMpp.write_parquet(m, tmp_path / "default", n_blocks=3)
+    assert pipsipmpppy.read_names(default) == {}

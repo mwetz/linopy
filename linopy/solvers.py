@@ -4143,7 +4143,11 @@ class PIPSIPMpp(Solver[None]):
         m.solve("pipsipmpp", n_blocks=4, write_parquet="model",
                 parquet_layout="distributed")
 
-    To write the files without solving, use :meth:`write_parquet`.
+    ``parquet_names=True`` additionally records each variable and constraint
+    under its own name and coordinates, so a matrix plotted from the files is
+    labelled the way the model reads. It is off by default because it costs a
+    lookup per label; the structure written is the same either way. To write the
+    files without solving, use :meth:`write_parquet`.
 
     ``options_file`` names a PIPS-IPM++ settings file - one ``NAME value`` per
     line, ``#`` and ``//`` starting a comment - read as the *base* configuration,
@@ -4178,6 +4182,7 @@ class PIPSIPMpp(Solver[None]):
             "comm",
             "write_parquet",
             "parquet_layout",
+            "parquet_names",
             "options_file",
         }
     )
@@ -4311,6 +4316,27 @@ class PIPSIPMpp(Solver[None]):
         )
         return problem, is_eq
 
+    @staticmethod
+    def _names(model: Model, is_eq: np.ndarray) -> dict[str, list[str]]:
+        """Variable and constraint names in the order the parquet format stores them."""
+        from linopy.common import format_coord
+
+        M = model.matrices
+        clabels = np.asarray(M.clabels)
+
+        def named(container: Any, labels: np.ndarray) -> list[str]:
+            # one cached binary search per label, which is why names are optional
+            positions = container.get_label_position(labels)
+            return [
+                f"{name}{format_coord(coord)}" if name is not None else str(label)
+                for label, (name, coord) in zip(labels, positions)
+            ]
+
+        return {
+            "cols": named(model.variables, np.asarray(M.vlabels)),
+            "rows": named(model.constraints, np.concatenate([clabels[is_eq], clabels[~is_eq]])),
+        }
+
     @classmethod
     def write_parquet(
         cls,
@@ -4319,6 +4345,7 @@ class PIPSIPMpp(Solver[None]):
         layout: str = "monolithic",
         n_blocks: int | None = None,
         block_dim: str = "snapshot",
+        names: bool = False,
     ) -> Path:
         """Write ``model`` as annotated parquet without solving it.
 
@@ -4330,16 +4357,22 @@ class PIPSIPMpp(Solver[None]):
 
             PIPSIPMpp.write_parquet(m, "model", layout="distributed", n_blocks=8)
 
+        ``names=True`` writes each variable and constraint under its own name and
+        coordinates, so a matrix plotted from the files is labelled the way the
+        model reads. It is off by default because it costs a lookup per label; the
+        structure written is the same either way.
+
         The files can be handed to PIPS-IPM++ directly (``pipsparquet model``),
         inspected with pipstools, or read back with ``pipsipmpppy``.
         """
         import pipsipmpppy
 
-        problem, _ = cls._structured_problem(model, n_blocks, block_dim)
+        problem, is_eq = cls._structured_problem(model, n_blocks, block_dim)
         return pipsipmpppy.write_problem(
             problem,
             path,
             layout=layout,
+            names=cls._names(model, is_eq) if names else None,
             # the problem carries minimisation costs; the sense records how the
             # model stated them
             sense=-1.0 if model.sense == "max" else 1.0,
@@ -4366,10 +4399,12 @@ class PIPSIPMpp(Solver[None]):
         if write_to is not None:
             import pipsipmpppy
 
+            with_names = self.options.get("parquet_names", False)
             stem = pipsipmpppy.write_problem(
                 problem,
                 write_to,
                 layout=self.options.get("parquet_layout", "monolithic"),
+                names=self._names(model, is_eq) if with_names else None,
                 sense=-1.0 if model.sense == "max" else 1.0,
             )
             logger.info("Wrote the annotated problem to %s", stem)
