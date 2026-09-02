@@ -5,6 +5,8 @@ The block-derivation tests run without PIPS-IPM++ installed; the solve tests are
 skipped unless ``pipsipmpppy`` is importable.
 """
 
+import importlib.util
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -332,3 +334,196 @@ def test_names_are_off_by_default(tmp_path) -> None:
     m = simple_model(6)
     default = PIPSIPMpp.write_parquet(m, tmp_path / "default", n_blocks=3)
     assert pipsipmpppy.read_names(default) == {}
+
+
+def _solution_beside(stem, objective: float = 12.5) -> None:
+    """Write a solution whose values are the global index they belong to."""
+    import pipsipmpppy
+    from pipsipmpppy.flat import solver_order, write_solution
+
+    order = solver_order(stem)
+    write_solution(
+        stem,
+        order=order,
+        status=pipsipmpppy.TerminationStatus.SUCCESSFUL_TERMINATION,
+        objective=objective,
+        runtime=0.0,
+        iterations=7,
+        primal=[float(c) for c in order.cols],
+        dual_eq=[float(r) for r in order.eq_rows],
+        dual_ineq=[float(r) for r in order.ineq_rows],
+    )
+
+
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+def test_read_parquet_solution_lands_on_the_model(tmp_path) -> None:
+    pytest.importorskip("pyarrow")
+
+    m = simple_model(6)
+    stem = PIPSIPMpp.write_parquet(m, tmp_path / "model", n_blocks=3)
+    _solution_beside(stem)
+
+    status, condition = m.assign_result(PIPSIPMpp.read_parquet_solution(m, stem))
+
+    assert (status, condition) == ("ok", "optimal")
+    assert m.objective.value == 12.5
+    # cap is written first, then the six gen entries, each carrying its position
+    assert float(m.variables["cap"].solution) == 0.0
+    assert list(m.variables["gen"].solution.values) == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+
+
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+def test_read_parquet_solution_places_the_duals_by_row(tmp_path) -> None:
+    pytest.importorskip("pyarrow")
+
+    m = simple_model(6)
+    stem = PIPSIPMpp.write_parquet(m, tmp_path / "model", n_blocks=3)
+    _solution_beside(stem)
+    m.assign_result(PIPSIPMpp.read_parquet_solution(m, stem))
+
+    # every constraint here is an inequality, so the duals follow the row order
+    duals = np.concatenate(
+        [m.constraints["caplimit"].dual.values, m.constraints["demand"].dual.values]
+    )
+    assert sorted(duals) == list(range(12))
+
+
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+def test_read_parquet_solution_flips_a_maximisation_back(tmp_path) -> None:
+    pytest.importorskip("pyarrow")
+
+    m = simple_model(6)
+    m.objective.sense = "max"
+    stem = PIPSIPMpp.write_parquet(m, tmp_path / "model", n_blocks=3)
+    # the file holds the minimisation objective PIPS-IPM++ worked with
+    _solution_beside(stem, objective=-12.5)
+
+    m.assign_result(PIPSIPMpp.read_parquet_solution(m, stem))
+
+    assert m.objective.value == 12.5
+    assert float(m.constraints["caplimit"].dual[0]) == -0.0
+
+
+# Automatic detection of block structures requires pipstools dependency
+pipstools_available = importlib.util.find_spec("pipstools") is not None
+mtkahypar_available = importlib.util.find_spec("mtkahypar") is not None
+
+# linopy names a variable "gen[wind, 17]", so this captures the last coordinate;
+# "cap" carries none and stays in the root
+LAST_COORD = r"(\d+)\]$"
+
+needs_pipstools = pytest.mark.skipif(
+    not (pipsipmpp_available and pipstools_available),
+    reason="pipsipmpppy and pipstools are both needed to derive a structure",
+)
+
+
+def annotation_kwargs(method: str) -> dict:
+    if method == "regex":
+        return {"annotation": "regex", "regex": LAST_COORD}
+    return {"annotation": "hypergraph"}
+
+
+def skip_if_unavailable(method: str) -> None:
+    if method == "hypergraph" and not mtkahypar_available:
+        pytest.skip("mtkahypar is needed for the hypergraph method")
+
+
+@needs_pipstools
+@pytest.mark.parametrize("method", ["regex", "hypergraph"])
+def test_annotation_derives_a_structure_for_a_model_without_one(method: str) -> None:
+    skip_if_unavailable(method)
+    m = simple_model(12)
+    assert m.blocks is None
+
+    problem, _is_eq = PIPSIPMpp._structured_problem(
+        m, n_blocks=4, **annotation_kwargs(method)
+    )
+
+    assert problem.n_blocks == 4
+    assert np.bincount(problem.var_block, minlength=5)[1:].min() > 0
+    problem.validate()
+
+
+@needs_pipstools
+def test_regex_keeps_the_coupling_variable_in_the_root() -> None:
+    """`cap` matches no coordinate, so it belongs where every block can see it."""
+    m = simple_model(12)
+    problem, _is_eq = PIPSIPMpp._structured_problem(
+        m, n_blocks=4, **annotation_kwargs("regex")
+    )
+    # cap is the first label, and the twelve gen entries follow
+    assert problem.var_block[0] == 0
+    assert (problem.var_block[1:] != 0).all()
+
+
+@needs_pipstools
+def test_deriving_without_a_block_count_is_refused() -> None:
+    with pytest.raises(ValueError, match="n_blocks"):
+        PIPSIPMpp._structured_problem(simple_model(12), annotation="hypergraph")
+
+
+@needs_pipstools
+def test_stating_no_structure_and_deriving_none_is_refused() -> None:
+    """Without an annotation the old error still names all three ways out."""
+    with pytest.raises(ValueError, match="annotation="):
+        PIPSIPMpp._structured_problem(simple_model(12))
+
+
+@needs_pipstools
+@pytest.mark.parametrize("method", ["regex", "hypergraph"])
+def test_a_derived_structure_solves_to_the_same_optimum(method: str) -> None:
+    skip_if_unavailable(method)
+    reference = simple_model(12)
+    reference.solve("highs")
+
+    m = simple_model(12)
+    m.solve("pipsipmpp", n_blocks=4, **annotation_kwargs(method))
+
+    assert m.status == "ok"
+    assert m.objective.value == pytest.approx(reference.objective.value, abs=1e-6)
+    assert np.allclose(
+        m.variables["gen"].solution.values,
+        reference.variables["gen"].solution.values,
+        atol=1e-6,
+    )
+
+
+@needs_pipstools
+@pytest.mark.parametrize("method", ["regex", "hypergraph"])
+def test_a_derived_structure_survives_the_parquet_roundtrip(tmp_path, method) -> None:
+    """Build here, solve there, read the answer back: the three steps apart."""
+    skip_if_unavailable(method)
+    pytest.importorskip("pyarrow")
+    import pipsipmpppy
+    from mpi4py import MPI
+
+    comm = MPI.COMM_WORLD
+    if comm.Get_size() != 1:
+        pytest.skip("this test drives MPI itself; run it on a single rank")
+
+    kwargs = annotation_kwargs(method)
+
+    in_memory = simple_model(12)
+    in_memory.solve("pipsipmpp", n_blocks=4, **kwargs)
+
+    # step one: write the annotated problem out, with no solver involved
+    m = simple_model(12)
+    stem = PIPSIPMpp.write_parquet(m, tmp_path / "model", n_blocks=4, **kwargs)
+    # step two: solve from the files alone
+    pipsipmpppy.solve_dataset(stem, comm, write_solution=True)
+    # step three: read it back onto the model, which needs no solver either
+    status, condition = m.assign_result(PIPSIPMpp.read_parquet_solution(m, stem))
+
+    assert (status, condition) == ("ok", "optimal")
+    assert m.objective.value == pytest.approx(in_memory.objective.value, abs=1e-6)
+    assert np.allclose(
+        m.variables["gen"].solution.values,
+        in_memory.variables["gen"].solution.values,
+        atol=1e-6,
+    )
+    assert np.allclose(
+        m.constraints["demand"].dual.values,
+        in_memory.constraints["demand"].dual.values,
+        atol=1e-6,
+    )

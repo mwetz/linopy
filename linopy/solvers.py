@@ -4111,7 +4111,7 @@ class MindOpt(Solver[None]):
 
 
 class PIPSIPMpp(Solver[None]):
-    """
+    r"""
     Solver subclass for PIPS-IPM++, via the ``pipsipmpppy`` package.
 
     PIPS-IPM++ is a parallel interior-point solver that exploits a
@@ -4131,6 +4131,26 @@ class PIPSIPMpp(Solver[None]):
     dimension into contiguous blocks::
 
         m.solve("pipsipmpp", n_blocks=4, LINEAR_LEAF_SOLVER="mumps")
+
+    A model that says nothing about blocks can have a structure derived for it
+    instead, which needs the optional pipstools dependency
+    (``pip install "pipsipmpppy[annotate]"``). ``annotation="hypergraph"``
+    partitions the matrix; ``annotation="regex"`` groups the variables by a
+    capture taken from their names, which is exact when the names already carry
+    the structure::
+
+        m.solve("pipsipmpp", n_blocks=4, annotation="hypergraph")
+        m.solve("pipsipmpp", n_blocks=4, annotation="regex", regex=r"(\d+)\]$")
+
+    linopy names a variable after its own name and coordinates, ``gen[wind, 17]``,
+    so the pattern above captures the last coordinate: a variable without one,
+    ``cap[wind]``, matches nothing and stays in the root, which is exactly where a
+    variable shared by every block belongs.
+
+    ``annotation_options`` is passed through to ``pipsipmpppy.annotate``, for
+    instance ``{"hypergraph": "colrow", "hg_objective": "cut"}``. Setting
+    ``annotation`` ignores :attr:`Model.blocks`, which is the point: it is the
+    path for a model that has none.
 
     Run under MPI to parallelise -- PIPS-IPM++ needs at least one leaf per rank::
 
@@ -4156,7 +4176,8 @@ class PIPSIPMpp(Solver[None]):
         m.solve("pipsipmpp", n_blocks=4, options_file="tuned.opt",
                 LINEAR_LEAF_SOLVER="mumps")   # overrides the file
 
-    Options other than ``n_blocks`` / ``block_dim`` / ``comm`` /
+    Options other than ``n_blocks`` / ``block_dim`` / ``annotation`` / ``regex`` /
+    ``annotation_options`` / ``comm`` /
     ``write_parquet`` / ``parquet_layout`` / ``options_file`` are forwarded to
     PIPS-IPM++ (e.g. ``LINEAR_LEAF_SOLVER``, ``LINEAR_ROOT_SOLVER``).
 
@@ -4179,6 +4200,9 @@ class PIPSIPMpp(Solver[None]):
         {
             "n_blocks",
             "block_dim",
+            "annotation",
+            "regex",
+            "annotation_options",
             "comm",
             "write_parquet",
             "parquet_layout",
@@ -4270,24 +4294,51 @@ class PIPSIPMpp(Solver[None]):
         model: Model,
         n_blocks: int | None = None,
         block_dim: str = "snapshot",
+        annotation: str | None = None,
+        regex: str | None = None,
+        annotation_options: dict[str, Any] | None = None,
     ) -> tuple[Any, np.ndarray]:
-        """Build the ``StructuredProblem`` for ``model``, and which rows are equalities."""
+        """Build the ``StructuredProblem`` for ``model``, and which rows are equalities.
+
+        Without ``annotation`` the blocks come from the model, which is the usual
+        path. With it they are derived from the matrix instead, and whatever the
+        model says about blocks is left alone; see :meth:`solve`.
+        """
         import pipsipmpppy
 
         if model.type in ["QP", "MILP"]:
             raise NotImplementedError("PIPS-IPM++ solves linear problems only.")
 
-        blocks = model.blocks
-        if blocks is None:
+        derive = annotation is not None or regex is not None
+        if derive:
             if n_blocks is None:
                 raise ValueError(
-                    "PIPS-IPM++ needs a block structure. Set `model.blocks` (a 1-D "
-                    "DataArray over the dimension to split) or pass the solver "
-                    "option `n_blocks=<int>` to split `block_dim` "
-                    "(default 'snapshot') into contiguous blocks."
+                    "Deriving a block structure needs `n_blocks=<int>`, the number "
+                    "of leaf blocks to aim for."
                 )
-            blocks = cls._blocks_from_dim(model, block_dim, int(n_blocks))
-        label_block, n_leaves = cls._variable_blocks(model, blocks)
+            if model.blocks is not None:
+                logger.warning(
+                    "`model.blocks` is set but ignored: annotation=%r derives the "
+                    "block structure from the matrix instead.",
+                    annotation,
+                )
+            # every variable in the root until pipstools says otherwise
+            label_block = np.zeros(model._xCounter + 1, dtype=np.int64)
+            n_leaves = int(n_blocks)
+        else:
+            blocks = model.blocks
+            if blocks is None:
+                if n_blocks is None:
+                    raise ValueError(
+                        "PIPS-IPM++ needs a block structure. Set `model.blocks` (a 1-D "
+                        "DataArray over the dimension to split), pass the solver "
+                        "option `n_blocks=<int>` to split `block_dim` "
+                        "(default 'snapshot') into contiguous blocks, or pass "
+                        "`annotation='hypergraph'`/`'regex'` to derive one from the "
+                        "matrix with pipstools."
+                    )
+                blocks = cls._blocks_from_dim(model, block_dim, int(n_blocks))
+            label_block, n_leaves = cls._variable_blocks(model, blocks)
 
         M = model.matrices
         if M.A is None:
@@ -4314,7 +4365,36 @@ class PIPSIPMpp(Solver[None]):
             ineq_upp=np.where(is_ge, np.inf, M.b)[~is_eq].astype(float),
             objconst=sign * objconst,
         )
+        if derive:
+            problem = cls._derive_blocks(
+                model, problem, is_eq, int(n_blocks), annotation, regex, annotation_options
+            )
         return problem, is_eq
+
+    @classmethod
+    def _derive_blocks(
+        cls,
+        model: Model,
+        problem: Any,
+        is_eq: np.ndarray,
+        n_blocks: int,
+        annotation: str | None,
+        regex: str | None,
+        annotation_options: dict[str, Any] | None,
+    ) -> Any:
+        """Hand the matrix to pipstools and take the annotation back."""
+        import pipsipmpppy
+
+        method = annotation or "regex"
+        options = dict(annotation_options or {})
+        if regex is not None:
+            options["regex"] = regex
+        # the regex matches variable names, which cost a lookup per label to build,
+        # so they are only collected for the method that reads them
+        names = cls._names(model, is_eq)["cols"] if method == "regex" else None
+        return pipsipmpppy.annotate(
+            problem, n_blocks, method=method, names=names, **options
+        )
 
     @staticmethod
     def _names(model: Model, is_eq: np.ndarray) -> dict[str, list[str]]:
@@ -4346,11 +4426,15 @@ class PIPSIPMpp(Solver[None]):
         n_blocks: int | None = None,
         block_dim: str = "snapshot",
         names: bool = False,
+        annotation: str | None = None,
+        regex: str | None = None,
+        annotation_options: dict[str, Any] | None = None,
     ) -> Path:
         """Write ``model`` as annotated parquet without solving it.
 
-        The block structure is taken from :attr:`Model.blocks`, or from
-        ``n_blocks``/``block_dim`` the same way :meth:`solve` takes it. ``layout``
+        The block structure is taken from :attr:`Model.blocks`, from
+        ``n_blocks``/``block_dim``, or derived from the matrix with
+        ``annotation=``, the same three ways :meth:`solve` takes it. ``layout``
         is ``"monolithic"`` for one set of files holding the whole model, or
         ``"distributed"`` for one set per block, which lets each rank of a later
         solve read only its own share::
@@ -4367,7 +4451,9 @@ class PIPSIPMpp(Solver[None]):
         """
         import pipsipmpppy
 
-        problem, is_eq = cls._structured_problem(model, n_blocks, block_dim)
+        problem, is_eq = cls._structured_problem(
+            model, n_blocks, block_dim, annotation, regex, annotation_options
+        )
         return pipsipmpppy.write_problem(
             problem,
             path,
@@ -4393,6 +4479,9 @@ class PIPSIPMpp(Solver[None]):
             model,
             self.options.get("n_blocks"),
             self.options.get("block_dim", "snapshot"),
+            self.options.get("annotation"),
+            self.options.get("regex"),
+            self.options.get("annotation_options"),
         )
 
         write_to = self.options.get("write_parquet")
@@ -4455,16 +4544,41 @@ class PIPSIPMpp(Solver[None]):
         )
         runtime = float(result.runtime)  # measured inside PIPS-IPM++
 
-        condition = self._CONDITION_MAP.get(result.status, TerminationCondition.unknown)
-        status = Status.from_termination_condition(condition)
-        status.legacy_status = f"{result.status.name}: {result.status.description}"
-
         # only rank 0 gathers primal/duals -> share them so every rank is consistent
         is_root = comm.Get_rank() == 0
         primal = comm.bcast(result.primal if is_root else None, root=0)
         dual_eq = comm.bcast(result.dual_eq if is_root else None, root=0)
         dual_ineq = comm.bcast(result.dual_ineq if is_root else None, root=0)
-        objective = float(result.objective)
+
+        status, solution = self._interpret_result(
+            result.status, float(result.objective), primal, dual_eq, dual_ineq
+        )
+
+        self.io_api = "direct"
+        return self._make_result(
+            status,
+            solution,
+            solver_model=problem,
+            report=SolverReport(runtime=runtime),
+        )
+
+    def _interpret_result(
+        self,
+        pips_status: Any,
+        objective: float,
+        primal: np.ndarray | None,
+        dual_eq: np.ndarray | None,
+        dual_ineq: np.ndarray | None,
+    ) -> tuple[Status, Solution]:
+        """Turn PIPS-IPM++ vectors into a linopy status and label-indexed solution.
+
+        Solving in memory and reading a solution back from parquet both end here,
+        so the two produce the same :class:`Solution` for the same model.
+        """
+        condition = self._CONDITION_MAP.get(pips_status, TerminationCondition.unknown)
+        status = Status.from_termination_condition(condition)
+        status.legacy_status = f"{pips_status.name}: {pips_status.description}"
+
         if self.sense == "max":
             objective = -objective
 
@@ -4485,14 +4599,50 @@ class PIPSIPMpp(Solver[None]):
             dual = _solution_from_labels(rows, self._clabels, self._n_cons)
             return Solution(sol, dual, objective)
 
-        solution = self.safe_get_solution(status=status, func=get_solver_solution)
+        return status, self.safe_get_solution(status=status, func=get_solver_solution)
 
+    @classmethod
+    def read_parquet_solution(cls, model: Model, path: str | Path) -> Result:
+        """Read a solution written beside the parquet problem at ``path``.
+
+        This is the other half of :meth:`write_parquet`: write the model, solve it
+        elsewhere with ``pipsparquet ... writesol`` or
+        ``pipsipmpppy.solve_dataset(..., write_solution=True)``, then read the
+        result back onto the model it came from::
+
+            PIPSIPMpp.write_parquet(m, "model", layout="distributed", n_blocks=8)
+            # ... solved elsewhere ...
+            m.assign_result(PIPSIPMpp.read_parquet_solution(m, "model"))
+            m.variables["cap"].solution
+
+        The returned :class:`linopy.constants.Result` is the one a direct solve
+        would have returned, so assigning it leaves the model in the same state:
+        the same primal and dual values, status and objective.
+
+        ``model`` has to be the one the files were written from. The solution is
+        matched to it by position, exactly as an in-memory solve is.
+        """
+        import pipsipmpppy
+
+        result = pipsipmpppy.read_solution(path)
+
+        self = cls()
+        self.model = model
+        self.sense = model.sense
+        self._cache_model_labels(model)
+        # which rows are equalities, in the same order write_parquet used
+        self._is_eq = np.asarray(model.matrices.sense, dtype=object) == "="
+
+        status, solution = self._interpret_result(
+            result.status,
+            float(result.objective),
+            result.primal,
+            result.dual_eq,
+            result.dual_ineq,
+        )
         self.io_api = "direct"
         return self._make_result(
-            status,
-            solution,
-            solver_model=problem,
-            report=SolverReport(runtime=runtime),
+            status, solution, report=SolverReport(runtime=float(result.runtime))
         )
 
 
