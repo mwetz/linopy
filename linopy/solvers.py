@@ -4112,7 +4112,7 @@ class MindOpt(Solver[None]):
 
 class PIPSIPMpp(Solver[None]):
     r"""
-    Solver subclass for PIPS-IPM++, via the ``pipsipmpppy`` package.
+    Solver subclass for PIPS-IPM++, via the ``pipsipmpp`` package.
 
     PIPS-IPM++ is a parallel interior-point solver that exploits a
     doubly-bordered block-diagonal LP: variables belong either to a root
@@ -4134,7 +4134,7 @@ class PIPSIPMpp(Solver[None]):
 
     A model that says nothing about blocks can have a structure derived for it
     instead, which needs the optional pipstools dependency
-    (``pip install "pipsipmpppy[annotate]"``). ``annotation="hypergraph"``
+    (``pip install "pipsipmpp[annotate]"``). ``annotation="hypergraph"``
     partitions the matrix; ``annotation="regex"`` groups the variables by a
     capture taken from their names, which is exact when the names already carry
     the structure::
@@ -4147,7 +4147,7 @@ class PIPSIPMpp(Solver[None]):
     ``cap[wind]``, matches nothing and stays in the root, which is exactly where a
     variable shared by every block belongs.
 
-    ``annotation_options`` is passed through to ``pipsipmpppy.annotate``, for
+    ``annotation_options`` is passed through to ``pipsipmpp.annotate``, for
     instance ``{"hypergraph": "colrow", "hg_objective": "cut"}``. Setting
     ``annotation`` ignores :attr:`Model.blocks`, which is the point: it is the
     path for a model that has none.
@@ -4217,7 +4217,7 @@ class PIPSIPMpp(Solver[None]):
     @functools.cached_property
     def _CONDITION_MAP(self) -> dict[Any, TerminationCondition]:
         """PIPS-IPM++ termination status -> linopy termination condition."""
-        from pipsipmpppy import TerminationStatus as T
+        from pipsipmpp import TerminationStatus as T
 
         TC = TerminationCondition
         return {
@@ -4237,7 +4237,7 @@ class PIPSIPMpp(Solver[None]):
     @classmethod
     @functools.cache
     def is_available(cls) -> bool:
-        return _has_module("pipsipmpppy")
+        return _has_module("pipsipmpp")
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -4304,7 +4304,7 @@ class PIPSIPMpp(Solver[None]):
         path. With it they are derived from the matrix instead, and whatever the
         model says about blocks is left alone; see :meth:`solve`.
         """
-        import pipsipmpppy
+        import pipsipmpp
 
         if model.type in ["QP", "MILP"]:
             raise NotImplementedError("PIPS-IPM++ solves linear problems only.")
@@ -4352,7 +4352,7 @@ class PIPSIPMpp(Solver[None]):
         sign = -1.0 if model.sense == "max" else 1.0
         objconst = float(getattr(model.objective, "constant", 0.0) or 0.0)
 
-        problem = pipsipmpppy.StructuredProblem(
+        problem = pipsipmpp.StructuredProblem(
             n_blocks=n_leaves,
             var_block=label_block[M.vlabels],
             c=sign * np.asarray(M.c, dtype=float),
@@ -4383,7 +4383,7 @@ class PIPSIPMpp(Solver[None]):
         annotation_options: dict[str, Any] | None,
     ) -> Any:
         """Hand the matrix to pipstools and take the annotation back."""
-        import pipsipmpppy
+        import pipsipmpp
 
         method = annotation or "regex"
         options = dict(annotation_options or {})
@@ -4392,7 +4392,7 @@ class PIPSIPMpp(Solver[None]):
         # the regex matches variable names, which cost a lookup per label to build,
         # so they are only collected for the method that reads them
         names = cls._names(model, is_eq)["cols"] if method == "regex" else None
-        return pipsipmpppy.annotate(
+        return pipsipmpp.annotate(
             problem, n_blocks, method=method, names=names, **options
         )
 
@@ -4447,14 +4447,14 @@ class PIPSIPMpp(Solver[None]):
         structure written is the same either way.
 
         The files can be handed to PIPS-IPM++ directly (``pipsparquet model``),
-        inspected with pipstools, or read back with ``pipsipmpppy``.
+        inspected with pipstools, or read back with ``pipsipmpp``.
         """
-        import pipsipmpppy
+        import pipsipmpp
 
         problem, is_eq = cls._structured_problem(
             model, n_blocks, block_dim, annotation, regex, annotation_options
         )
-        return pipsipmpppy.write_problem(
+        return pipsipmpp.write_problem(
             problem,
             path,
             layout=layout,
@@ -4486,10 +4486,10 @@ class PIPSIPMpp(Solver[None]):
 
         write_to = self.options.get("write_parquet")
         if write_to is not None:
-            import pipsipmpppy
+            import pipsipmpp
 
             with_names = self.options.get("parquet_names", False)
-            stem = pipsipmpppy.write_problem(
+            stem = pipsipmpp.write_problem(
                 problem,
                 write_to,
                 layout=self.options.get("parquet_layout", "monolithic"),
@@ -4513,7 +4513,7 @@ class PIPSIPMpp(Solver[None]):
         env: Any = None,
         **kw: Any,
     ) -> Result:
-        import pipsipmpppy
+        import pipsipmpp
 
         problem = self.solver_model
         assert problem is not None
@@ -4535,8 +4535,8 @@ class PIPSIPMpp(Solver[None]):
         if log_fn is not None:
             logger.warning("Log files are not supported by PIPS-IPM++. Ignoring.")
 
-        # rank 0 owns the problem; pipsipmpppy scatters the blocks collectively
-        result = pipsipmpppy.solve(
+        # rank 0 owns the problem; pipsipmpp scatters the blocks collectively
+        result = pipsipmpp.solve(
             problem if comm.Get_rank() == 0 else None,
             comm,
             options=pips_options,
@@ -4607,7 +4607,7 @@ class PIPSIPMpp(Solver[None]):
 
         This is the other half of :meth:`write_parquet`: write the model, solve it
         elsewhere with ``pipsparquet ... writesol`` or
-        ``pipsipmpppy.solve_dataset(..., write_solution=True)``, then read the
+        ``pipsipmpp.solve_dataset(..., write_solution=True)``, then read the
         result back onto the model it came from::
 
             PIPSIPMpp.write_parquet(m, "model", layout="distributed", n_blocks=8)
@@ -4622,9 +4622,9 @@ class PIPSIPMpp(Solver[None]):
         ``model`` has to be the one the files were written from. The solution is
         matched to it by position, exactly as an in-memory solve is.
         """
-        import pipsipmpppy
+        import pipsipmpp
 
-        result = pipsipmpppy.read_solution(path)
+        result = pipsipmpp.read_solution(path)
 
         self = cls()
         self.model = model

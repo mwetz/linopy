@@ -2,7 +2,7 @@
 Tests for the PIPS-IPM++ solver interface and its block derivation.
 
 The block-derivation tests run without PIPS-IPM++ installed; the solve tests are
-skipped unless ``pipsipmpppy`` is importable.
+skipped unless ``pipsipmpp`` is importable.
 """
 
 import importlib.util
@@ -74,14 +74,14 @@ def test_variable_blocks_put_dimensionless_variables_in_the_root() -> None:
     assert gen_blocks.tolist() == [1] * 3 + [2] * 3 + [3] * 3 + [4] * 3
 
 
-@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpp not installed")
 def test_missing_blocks_raises_a_helpful_error() -> None:
     m = simple_model()
     with pytest.raises(ValueError, match="needs a block structure"):
         m.solve("pipsipmpp")
 
 
-@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpp not installed")
 def test_pipsipmpp_matches_highs() -> None:
     ref = simple_model(12)
     ref.solve("highs")
@@ -98,7 +98,7 @@ def test_pipsipmpp_matches_highs() -> None:
     )
 
 
-@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpp not installed")
 def test_explicit_model_blocks_are_used() -> None:
     """`model.blocks` set by hand takes precedence over the n_blocks option."""
     m = simple_model(12)
@@ -107,7 +107,7 @@ def test_explicit_model_blocks_are_used() -> None:
     assert m.status == "ok"
 
 
-@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpp not installed")
 def test_duals_and_runtime_are_returned() -> None:
     ref = simple_model(12)
     ref.solve("highs")
@@ -128,10 +128,10 @@ def test_duals_and_runtime_are_returned() -> None:
     assert m.solver.report.runtime > 0.0
 
 
-@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpp not installed")
 def test_termination_status_map_covers_every_pips_status() -> None:
     """Every PIPS-IPM++ status must map to a linopy termination condition."""
-    from pipsipmpppy import TerminationStatus
+    from pipsipmpp import TerminationStatus
 
     mapping = PIPSIPMpp(model=None)._CONDITION_MAP
     missing = set(TerminationStatus) - set(mapping)
@@ -140,7 +140,7 @@ def test_termination_status_map_covers_every_pips_status() -> None:
     )
 
 
-@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpp not installed")
 @pytest.mark.parametrize(
     "kwargs,options,expected",
     [
@@ -165,17 +165,17 @@ def test_statuses_are_propagated(kwargs, options, expected) -> None:
         assert m.solver.status.legacy_status.split(":")[0] != "SUCCESSFUL_TERMINATION"
 
 
-@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpp not installed")
 @pytest.mark.parametrize("layout", ["monolithic", "distributed"])
 def test_write_parquet_exports_without_solving(tmp_path, layout) -> None:
     """The annotated model can be written out for a later or remote solve."""
     pytest.importorskip("pyarrow")
-    import pipsipmpppy
+    import pipsipmpp
 
     m = simple_model(12)
     stem = PIPSIPMpp.write_parquet(m, tmp_path / "model", layout=layout, n_blocks=3)
 
-    manifest = pipsipmpppy.read_manifest(stem)
+    manifest = pipsipmpp.read_manifest(stem)
     assert manifest["layout"] == layout
     assert manifest["n_blocks"] == 4  # the root counts alongside the three leaves
     assert manifest["n_cols"] == m.matrices.vlabels.size
@@ -183,10 +183,10 @@ def test_write_parquet_exports_without_solving(tmp_path, layout) -> None:
     assert [block["n"] for block in manifest["blocks"]] == [1, 4, 4, 4]
 
 
-@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpp not installed")
 def test_write_parquet_records_a_maximisation(tmp_path) -> None:
     pytest.importorskip("pyarrow")
-    import pipsipmpppy
+    import pipsipmpp
 
     m = simple_model(12)
     m.objective = -(10 * m.variables["cap"] + m.variables["gen"].sum())
@@ -194,19 +194,19 @@ def test_write_parquet_records_a_maximisation(tmp_path) -> None:
 
     stem = PIPSIPMpp.write_parquet(m, tmp_path / "model", n_blocks=3)
     # the problem holds minimisation costs; objcoef records how the model stated them
-    assert pipsipmpppy.read_manifest(stem)["objcoef"] == -1.0
+    assert pipsipmpp.read_manifest(stem)["objcoef"] == -1.0
 
 
-@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpp not installed")
 def test_both_layouts_describe_the_same_problem(tmp_path) -> None:
     pytest.importorskip("pyarrow")
-    import pipsipmpppy
+    import pipsipmpp
 
     m = simple_model(12)
-    whole = pipsipmpppy.read_manifest(
+    whole = pipsipmpp.read_manifest(
         PIPSIPMpp.write_parquet(m, tmp_path / "whole", n_blocks=3)
     )
-    split = pipsipmpppy.read_manifest(
+    split = pipsipmpp.read_manifest(
         PIPSIPMpp.write_parquet(m, tmp_path / "split", layout="distributed", n_blocks=3)
     )
 
@@ -229,14 +229,14 @@ def options_file(tmp_path):
     return path
 
 
-@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpp not installed")
 def test_options_file_is_used_as_the_base(options_file) -> None:
     m = simple_model(9)
     _, condition = m.solve("pipsipmpp", n_blocks=3, options_file=str(options_file))
     assert condition == "optimal"
 
 
-@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpp not installed")
 def test_solver_options_override_the_file(options_file) -> None:
     """The file is the base; options passed alongside it win."""
     m = simple_model(9)
@@ -256,30 +256,30 @@ def test_solver_options_override_the_file(options_file) -> None:
     assert m.objective.value == pytest.approx(plain.objective.value, abs=1e-5)
 
 
-@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpp not installed")
 def test_a_missing_options_file_is_reported(tmp_path) -> None:
     m = simple_model(9)
     with pytest.raises(FileNotFoundError, match="options file"):
         m.solve("pipsipmpp", n_blocks=3, options_file=str(tmp_path / "absent.opt"))
 
 
-@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpp not installed")
 def test_options_file_is_not_forwarded_as_a_solver_option() -> None:
     assert "options_file" in PIPSIPMpp._INTERFACE_OPTIONS
 
 
-@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpp not installed")
 @pytest.mark.parametrize("layout", ["monolithic", "distributed"])
 def test_write_parquet_carries_model_names(tmp_path, layout) -> None:
     """Names make a plotted matrix readable, so they must match the model's own."""
     pytest.importorskip("pyarrow")
-    import pipsipmpppy
+    import pipsipmpp
 
     m = simple_model(6)
     stem = PIPSIPMpp.write_parquet(
         m, tmp_path / "named", layout=layout, n_blocks=3, names=True
     )
-    names = pipsipmpppy.read_names(stem)
+    names = pipsipmpp.read_names(stem)
 
     assert names["cols"] == ["cap"] + [f"gen[{i}]" for i in range(6)]
     # rows are stored equalities first, and this model has only inequalities
@@ -288,7 +288,7 @@ def test_write_parquet_carries_model_names(tmp_path, layout) -> None:
     )
 
 
-@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpp not installed")
 def test_names_line_up_with_the_rows_they_label(tmp_path) -> None:
     """A name on the wrong row would mislabel a plot without failing anywhere."""
     pq = pytest.importorskip("pyarrow.parquet")
@@ -309,43 +309,43 @@ def test_names_line_up_with_the_rows_they_label(tmp_path) -> None:
     assert int(cols.loc[cols["name"] == "gen[3]", "partition"].iloc[0]) != 1
 
 
-@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpp not installed")
 def test_names_can_be_left_out(tmp_path) -> None:
     pytest.importorskip("pyarrow")
-    import pipsipmpppy
+    import pipsipmpp
 
     m = simple_model(6)
     plain = PIPSIPMpp.write_parquet(m, tmp_path / "plain", n_blocks=3, names=False)
-    assert pipsipmpppy.read_names(plain) == {}
+    assert pipsipmpp.read_names(plain) == {}
     # leaving the names out must not change the structure
     named = PIPSIPMpp.write_parquet(m, tmp_path / "named", n_blocks=3, names=True)
     keys = ("n", "my", "mz", "myl", "mzl")
     assert [
-        [b[k] for k in keys] for b in pipsipmpppy.read_manifest(plain)["blocks"]
-    ] == [[b[k] for k in keys] for b in pipsipmpppy.read_manifest(named)["blocks"]]
+        [b[k] for k in keys] for b in pipsipmpp.read_manifest(plain)["blocks"]
+    ] == [[b[k] for k in keys] for b in pipsipmpp.read_manifest(named)["blocks"]]
 
 
-@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpp not installed")
 def test_names_are_off_by_default(tmp_path) -> None:
     """Producing names costs a lookup per label, so they are opt-in."""
     pytest.importorskip("pyarrow")
-    import pipsipmpppy
+    import pipsipmpp
 
     m = simple_model(6)
     default = PIPSIPMpp.write_parquet(m, tmp_path / "default", n_blocks=3)
-    assert pipsipmpppy.read_names(default) == {}
+    assert pipsipmpp.read_names(default) == {}
 
 
 def _solution_beside(stem, objective: float = 12.5) -> None:
     """Write a solution whose values are the global index they belong to."""
-    import pipsipmpppy
-    from pipsipmpppy.flat import solver_order, write_solution
+    import pipsipmpp
+    from pipsipmpp.flat import solver_order, write_solution
 
     order = solver_order(stem)
     write_solution(
         stem,
         order=order,
-        status=pipsipmpppy.TerminationStatus.SUCCESSFUL_TERMINATION,
+        status=pipsipmpp.TerminationStatus.SUCCESSFUL_TERMINATION,
         objective=objective,
         runtime=0.0,
         iterations=7,
@@ -355,7 +355,7 @@ def _solution_beside(stem, objective: float = 12.5) -> None:
     )
 
 
-@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpp not installed")
 def test_read_parquet_solution_lands_on_the_model(tmp_path) -> None:
     pytest.importorskip("pyarrow")
 
@@ -372,7 +372,7 @@ def test_read_parquet_solution_lands_on_the_model(tmp_path) -> None:
     assert list(m.variables["gen"].solution.values) == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
 
 
-@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpp not installed")
 def test_read_parquet_solution_places_the_duals_by_row(tmp_path) -> None:
     pytest.importorskip("pyarrow")
 
@@ -388,7 +388,7 @@ def test_read_parquet_solution_places_the_duals_by_row(tmp_path) -> None:
     assert sorted(duals) == list(range(12))
 
 
-@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpppy not installed")
+@pytest.mark.skipif(not pipsipmpp_available, reason="pipsipmpp not installed")
 def test_read_parquet_solution_flips_a_maximisation_back(tmp_path) -> None:
     pytest.importorskip("pyarrow")
 
@@ -414,7 +414,7 @@ LAST_COORD = r"(\d+)\]$"
 
 needs_pipstools = pytest.mark.skipif(
     not (pipsipmpp_available and pipstools_available),
-    reason="pipsipmpppy and pipstools are both needed to derive a structure",
+    reason="pipsipmpp and pipstools are both needed to derive a structure",
 )
 
 
@@ -495,7 +495,7 @@ def test_a_derived_structure_survives_the_parquet_roundtrip(tmp_path, method) ->
     """Build here, solve there, read the answer back: the three steps apart."""
     skip_if_unavailable(method)
     pytest.importorskip("pyarrow")
-    import pipsipmpppy
+    import pipsipmpp
     from mpi4py import MPI
 
     comm = MPI.COMM_WORLD
@@ -511,7 +511,7 @@ def test_a_derived_structure_survives_the_parquet_roundtrip(tmp_path, method) ->
     m = simple_model(12)
     stem = PIPSIPMpp.write_parquet(m, tmp_path / "model", n_blocks=4, **kwargs)
     # step two: solve from the files alone
-    pipsipmpppy.solve_dataset(stem, comm, write_solution=True)
+    pipsipmpp.solve_dataset(stem, comm, write_solution=True)
     # step three: read it back onto the model, which needs no solver either
     status, condition = m.assign_result(PIPSIPMpp.read_parquet_solution(m, stem))
 
